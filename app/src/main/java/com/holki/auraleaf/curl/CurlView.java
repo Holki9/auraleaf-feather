@@ -16,6 +16,7 @@ import android.util.AttributeSet;
 import android.view.GestureDetector;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
+import android.view.VelocityTracker;
 import android.view.View;
 import android.view.ViewConfiguration;
 import com.holki.auraleaf.HapticHelper;
@@ -25,18 +26,14 @@ import java.util.List;
 
 /**
  * RealisticBookEngine for AuraLeaf Feather.
- * 100% Faithful Port of the 2.5D Analytical Projective Geometry & 2nd-Order Spring-Damper Engine
- * from the HTML reference:
+ * 100% Faithful Port of the 2.5D Analytical Projective Geometry & 2nd-Order Spring-Damper Engine:
  *  - 2nd-Order Differential Spring-Mass-Damper Equations (Hooke's Law with Viscous Damping)
- *  - Perpendicular Midpoint Bisector Fold Line Geometry
- *  - Sutherland-Hodgman Polygon Half-Plane Clipping
- *  - Householder 2D Reflection Tensor Matrix
- *  - Dynamic Spine Tau Clamping (|tau| <= xFoldCenter * 0.96)
- *  - Roll Compression (tanh) & Velocity Speed Camber Bend
- *  - Quadratic Bezier Camber Elastic Edge Flexion
- *  - Grab-Anywhere Normalized Drag Span
- *  - Tactile Radial Touch Depression Wave
- *  - Multi-Stage Cylindrical Specular Sheen & Cut Paper Edge Highlight
+ *  - Midpoint Bisector Fold Line with Roll Compression (tanh) & Velocity Speed Bend
+ *  - Elastic Quadratic Bezier Camber Flexion
+ *  - Edge-Zone Tapping (Right -> Next, Left -> Prev, Center -> Menu)
+ *  - Direction-Based Swipe Detection (Left -> Next, Right -> Prev, Zero Time-Loops)
+ *  - Effortless 28% Flip Completion Threshold with Flick Gesture Support
+ *  - Clean Unmirrored Text and Symmetrical Fullscreen Layout
  */
 public class CurlView extends View {
 
@@ -77,6 +74,13 @@ public class CurlView extends View {
     private float mLastPanY = 0f;
     private float mTouchSlop = 24f;
 
+    // Touch & Swipe tracking
+    private float mDownScreenX = 0f;
+    private float mDownScreenY = 0f;
+    private long mDownTime = 0;
+    private boolean mIsDragging = false;
+    private VelocityTracker mVelocityTracker;
+
     // RealisticBookEngine Config (Exact values from HTML)
     public static class Config {
         public float softness = 0.85f;     // Softness of paper roll
@@ -92,7 +96,7 @@ public class CurlView extends View {
         boolean isDragging = false;
         boolean isHovering = false;
         boolean isAnimatingRelease = false;
-        int side = 1; // +1 = forward, -1 = backward
+        int side = 1; // +1 = forward (left swipe), -1 = backward (right swipe)
 
         float grabX = 0f;
         float grabY = 0f;
@@ -154,14 +158,6 @@ public class CurlView extends View {
         mEdgePaint.setColor(Color.argb(140, 226, 232, 240));
 
         mGestureDetector = new GestureDetector(context, new GestureDetector.SimpleOnGestureListener() {
-            @Override
-            public boolean onSingleTapConfirmed(MotionEvent e) {
-                if (!mCurl.isDragging && !mCurl.active && mTapListener != null) {
-                    mTapListener.onSingleTap();
-                }
-                return true;
-            }
-
             @Override
             public boolean onDoubleTap(MotionEvent e) {
                 resetZoom();
@@ -323,14 +319,26 @@ public class CurlView extends View {
         mCurl.isAnimatingRelease = true;
         mCurl.side = side;
 
-        mCurl.grabX = W * 0.85f;
-        mCurl.grabY = H * 0.28f;
-        mCurl.curX = W * 0.82f;
-        mCurl.curY = H * 0.26f;
-        mCurl.velX = -W * 2.2f;
-        mCurl.velY = -H * 0.40f;
-        mCurl.targetX = -W;
-        mCurl.targetY = 0f;
+        if (side == 1) {
+            mCurl.grabX = W * 0.88f;
+            mCurl.grabY = H * 0.28f;
+            mCurl.curX = W * 0.85f;
+            mCurl.curY = H * 0.26f;
+            mCurl.velX = -W * 2.8f;
+            mCurl.velY = -H * 0.40f;
+            mCurl.targetX = -W;
+            mCurl.targetY = 0f;
+        } else {
+            mCurl.grabX = W * 0.12f;
+            mCurl.grabY = H * 0.28f;
+            mCurl.curX = W * 0.15f;
+            mCurl.curY = H * 0.26f;
+            mCurl.velX = W * 2.8f;
+            mCurl.velY = -H * 0.40f;
+            mCurl.targetX = 2f * W;
+            mCurl.targetY = 0f;
+        }
+
         mCurl.completeFlipOnFinish = true;
         mCurl.targetIndexAfterFlip = targetIndex;
 
@@ -338,15 +346,6 @@ public class CurlView extends View {
         if (mHapticHelper != null) mHapticHelper.vibratePageFlip();
         mLastPhysicsTime = System.nanoTime();
         postInvalidateOnAnimation();
-    }
-
-    // Screen coordinate to Book local coordinate
-    private float screenToBookX(float screenX) {
-        if (mViewMode == SHOW_TWO_PAGES) {
-            return screenX - getWidth() / 2f;
-        } else {
-            return screenX;
-        }
     }
 
     private float screenToBookY(float screenY) {
@@ -362,7 +361,7 @@ public class CurlView extends View {
             mScaleDetector.onTouchEvent(me);
         }
         if (mScaleDetector != null && mScaleDetector.isInProgress()) {
-            mCurl.isDragging = false;
+            mIsDragging = false;
             mLastPanX = me.getX();
             mLastPanY = me.getY();
             return true;
@@ -384,30 +383,95 @@ public class CurlView extends View {
             return true;
         }
 
-        float bx = screenToBookX(me.getX());
-        float by = screenToBookY(me.getY());
         int action = me.getActionMasked();
 
         switch (action) {
             case MotionEvent.ACTION_DOWN: {
-                handleGrabStart(bx, by);
+                mDownScreenX = me.getX();
+                mDownScreenY = me.getY();
+                mDownTime = System.currentTimeMillis();
+                mIsDragging = false;
+
+                if (mVelocityTracker == null) {
+                    mVelocityTracker = VelocityTracker.obtain();
+                } else {
+                    mVelocityTracker.clear();
+                }
+                mVelocityTracker.addMovement(me);
                 return true;
             }
+
             case MotionEvent.ACTION_MOVE: {
-                if (mCurl.isDragging) {
-                    handleGrabMove(bx, by);
-                } else if (!mCurl.active) {
-                    float dist = (float) Math.hypot(bx - mCurl.grabX, by - mCurl.grabY);
-                    if (dist > mTouchSlop) {
-                        handleGrabStart(bx, by);
+                if (mVelocityTracker != null) {
+                    mVelocityTracker.addMovement(me);
+                }
+
+                float dx = me.getX() - mDownScreenX;
+                float dy = me.getY() - mDownScreenY;
+
+                // Only start drag when finger movement exceeds touch slop
+                if (!mIsDragging) {
+                    if (Math.hypot(dx, dy) > mTouchSlop) {
+                        int side;
+                        if (mViewMode == SHOW_TWO_PAGES) {
+                            side = (mDownScreenX >= getWidth() / 2f) ? 1 : -1;
+                        } else {
+                            // Single page mode: direction is strictly determined by drag vector dx!
+                            // Dragging left (dx < 0) = Flip Next (side = 1)
+                            // Dragging right (dx > 0) = Flip Prev (side = -1)
+                            side = (dx < 0) ? 1 : -1;
+                        }
+
+                        int total = mPageProvider != null ? mPageProvider.getPageCount() : 0;
+                        int step = (mViewMode == SHOW_TWO_PAGES) ? 2 : 1;
+                        if (side == 1 && mCurrentIndex >= total - 1) return true;
+                        if (side == -1 && mCurrentIndex <= 0) return true;
+
+                        mIsDragging = true;
+                        handleGrabStart(side, mDownScreenX, mDownScreenY);
                     }
+                }
+
+                if (mIsDragging) {
+                    handleGrabMove(me.getX(), me.getY());
+                    return true;
                 }
                 return true;
             }
-            case MotionEvent.ACTION_UP:
+
+            case MotionEvent.ACTION_UP: {
+                if (mVelocityTracker != null) {
+                    mVelocityTracker.addMovement(me);
+                    mVelocityTracker.computeCurrentVelocity(1000);
+                }
+                float vx = (mVelocityTracker != null) ? mVelocityTracker.getXVelocity() : 0f;
+                if (mVelocityTracker != null) {
+                    mVelocityTracker.recycle();
+                    mVelocityTracker = null;
+                }
+
+                if (mIsDragging) {
+                    mIsDragging = false;
+                    handleGrabEnd(vx);
+                    return true;
+                }
+
+                // If not dragging, handle as a TAP
+                long duration = System.currentTimeMillis() - mDownTime;
+                if (duration < 450) {
+                    handleTap(me.getX(), me.getY());
+                }
+                return true;
+            }
+
             case MotionEvent.ACTION_CANCEL: {
-                if (mCurl.isDragging) {
-                    handleGrabEnd();
+                if (mVelocityTracker != null) {
+                    mVelocityTracker.recycle();
+                    mVelocityTracker = null;
+                }
+                if (mIsDragging) {
+                    mIsDragging = false;
+                    handleGrabEnd(0f);
                 }
                 return true;
             }
@@ -415,25 +479,30 @@ public class CurlView extends View {
         return super.onTouchEvent(me);
     }
 
-    // Exact HTML handleGrabStart implementation
-    private void handleGrabStart(float bx, float by) {
-        if (mPageProvider == null) return;
+    // Handles tap events: edge zones flip pages, center toggles menu
+    private void handleTap(float x, float y) {
+        if (mZoomScale > 1.05f) return;
+        float viewW = getWidth();
+        if (viewW <= 0) return;
+
+        if (x > viewW * 0.72f) {
+            // Right 28% -> Next Page
+            flipNext();
+        } else if (x < viewW * 0.28f) {
+            // Left 28% -> Previous Page
+            flipPrev();
+        } else {
+            // Middle 44% -> Menu / UI Toggle
+            if (mTapListener != null) {
+                mTapListener.onSingleTap();
+            }
+        }
+    }
+
+    // Grab start with direction-aware edge initialization
+    private void handleGrabStart(int side, float startX, float startY) {
         float W = mPageW;
         float H = mPageH;
-
-        int side;
-        if (mViewMode == SHOW_TWO_PAGES) {
-            if (Math.abs(bx) > W * 1.08f || Math.abs(by) > H * 0.56f) return;
-            side = bx >= 0 ? 1 : -1;
-        } else {
-            // Single page: touch on right 65% = forward (+1), left 35% = backward (-1)
-            side = bx >= W * 0.35f ? 1 : -1;
-        }
-
-        int total = mPageProvider.getPageCount();
-        int step = (mViewMode == SHOW_TWO_PAGES) ? 2 : 1;
-        if (side == 1 && mCurrentIndex >= total - 1) return;
-        if (side == -1 && mCurrentIndex <= 0) return;
 
         mCurl.active = true;
         mCurl.isDragging = true;
@@ -441,24 +510,27 @@ public class CurlView extends View {
         mCurl.isAnimatingRelease = false;
         mCurl.side = side;
 
-        // In Single Page mode: if side == -1 (flipping backward), mirror bx: bx' = W - bx
-        float mappedBx = (mViewMode == SHOW_ONE_PAGE && side == -1) ? (W - bx) : bx;
-
-        mCurl.grabX = Math.max(0f, Math.min(W, mappedBx));
-        mCurl.grabY = Math.max(-H / 2f, Math.min(H / 2f, by));
+        mCurl.grabY = Math.max(-H / 2f, Math.min(H / 2f, screenToBookY(startY)));
         mCurl.pressStrength = 1.0f;
 
-        // Instant soft pre-lift from HTML
-        float initialLift = W * (0.14f + 0.08f * mConfig.softness);
-        float startEdgeX = W - initialLift;
-        float startEdgeY = mCurl.grabY * 0.92f;
+        float initialLift = W * (0.12f + 0.06f * mConfig.softness);
 
-        if (!mCurl.active || mCurl.isAnimatingRelease) {
+        if (side == 1) {
+            // Next page: curl starts from right edge W towards left
+            mCurl.grabX = W;
             mCurl.curX = W;
             mCurl.curY = mCurl.grabY;
+            mCurl.targetX = W - initialLift;
+            mCurl.targetY = mCurl.grabY * 0.92f;
+        } else {
+            // Prev page: curl starts from left edge 0 towards right
+            mCurl.grabX = 0f;
+            mCurl.curX = 0f;
+            mCurl.curY = mCurl.grabY;
+            mCurl.targetX = initialLift;
+            mCurl.targetY = mCurl.grabY * 0.92f;
         }
-        mCurl.targetX = startEdgeX;
-        mCurl.targetY = startEdgeY;
+
         mCurl.velX = 0f;
         mCurl.velY = 0f;
 
@@ -467,28 +539,38 @@ public class CurlView extends View {
         postInvalidateOnAnimation();
     }
 
-    // Exact HTML handleGrabMove implementation with normalized drag span
-    private void handleGrabMove(float bx, float by) {
+    // Drag move with normalized span mapping
+    private void handleGrabMove(float currentX, float currentY) {
         float W = mPageW;
         float H = mPageH;
         int side = mCurl.side;
 
-        float effBx = (mViewMode == SHOW_ONE_PAGE && side == -1) ? (W - bx) : bx;
-        float dy = by - mCurl.grabY;
+        float dx = currentX - mDownScreenX;
+        float dy = currentY - mDownScreenY;
 
-        // Normalized drag span from HTML
-        float span = Math.max(W * 0.65f, mCurl.grabX + W);
-        float progress = (mCurl.grabX - effBx) / span;
-        float baseLift = W * 0.12f;
-        float mappedX = W - baseLift - progress * (2f * W - baseLift);
+        float span = W * 0.85f;
+        float baseLift = W * 0.10f;
 
-        mCurl.targetX = Math.max(-W * 1.05f, Math.min(W * 1.05f, mappedX));
+        if (side == 1) {
+            // Dragging left: dx is negative
+            float dragDist = Math.max(0f, -dx);
+            float progress = dragDist / span;
+            float mappedX = W - baseLift - progress * (2.1f * W - baseLift);
+            mCurl.targetX = Math.max(-W * 1.05f, Math.min(W * 1.05f, mappedX));
+        } else {
+            // Dragging right: dx is positive
+            float dragDist = Math.max(0f, dx);
+            float progress = dragDist / span;
+            float mappedX = baseLift + progress * (2.1f * W - baseLift);
+            mCurl.targetX = Math.max(-W * 0.05f, Math.min(W * 2.05f, mappedX));
+        }
+
         mCurl.targetY = Math.max(-H * 0.85f, Math.min(H * 0.85f, mCurl.grabY + dy * 1.15f));
         postInvalidateOnAnimation();
     }
 
-    // Exact HTML handleGrabEnd implementation
-    private void handleGrabEnd() {
+    // Effortless 28% completion threshold with flick gesture detection
+    private void handleGrabEnd(float vx) {
         mCurl.isDragging = false;
         mCurl.isHovering = false;
         mCurl.isAnimatingRelease = true;
@@ -497,22 +579,48 @@ public class CurlView extends View {
         float W = mPageW;
         int side = mCurl.side;
 
-        // Account for projected velocity inertia from HTML
-        float projectedX = mCurl.curX + mCurl.velX * 0.18f;
-        boolean shouldCompleteFlip = (projectedX < W * 0.18f);
-
         int step = (mViewMode == SHOW_TWO_PAGES) ? 2 : 1;
-        if (shouldCompleteFlip) {
-            mCurl.completeFlipOnFinish = true;
-            mCurl.targetIndexAfterFlip = (side == 1) ? mCurrentIndex + step : mCurrentIndex - step;
-            mCurl.targetX = -W;
-            mCurl.targetY = 0f;
-            if (mSoundHelper != null) mSoundHelper.playFlip();
-            if (mHapticHelper != null) mHapticHelper.vibratePageFlip();
+
+        if (side == 1) {
+            float flipVelocity = -vx; // positive if flicked left
+            boolean isFlick = flipVelocity > 350f;
+            // Complete if page moved past 28% of screen OR flicked
+            boolean shouldComplete = (mCurl.curX < W * 0.72f) || isFlick;
+
+            if (shouldComplete) {
+                mCurl.completeFlipOnFinish = true;
+                mCurl.targetIndexAfterFlip = mCurrentIndex + step;
+                mCurl.targetX = -W;
+                mCurl.targetY = 0f;
+                mCurl.velX = Math.min(mCurl.velX, -W * 1.8f);
+                if (mSoundHelper != null) mSoundHelper.playFlip();
+                if (mHapticHelper != null) mHapticHelper.vibratePageFlip();
+            } else {
+                mCurl.completeFlipOnFinish = false;
+                mCurl.targetX = W;
+                mCurl.targetY = mCurl.grabY * 0.5f;
+                mCurl.velX = Math.max(mCurl.velX, W * 1.2f);
+            }
         } else {
-            mCurl.completeFlipOnFinish = false;
-            mCurl.targetX = W;
-            mCurl.targetY = mCurl.grabY * 0.5f;
+            float flipVelocity = vx; // positive if flicked right
+            boolean isFlick = flipVelocity > 350f;
+            // Complete if page moved past 28% of screen OR flicked
+            boolean shouldComplete = (mCurl.curX > W * 0.28f) || isFlick;
+
+            if (shouldComplete) {
+                mCurl.completeFlipOnFinish = true;
+                mCurl.targetIndexAfterFlip = mCurrentIndex - step;
+                mCurl.targetX = 2f * W;
+                mCurl.targetY = 0f;
+                mCurl.velX = Math.max(mCurl.velX, W * 1.8f);
+                if (mSoundHelper != null) mSoundHelper.playFlip();
+                if (mHapticHelper != null) mHapticHelper.vibratePageFlip();
+            } else {
+                mCurl.completeFlipOnFinish = false;
+                mCurl.targetX = 0f;
+                mCurl.targetY = mCurl.grabY * 0.5f;
+                mCurl.velX = Math.min(mCurl.velX, -W * 1.2f);
+            }
         }
         postInvalidateOnAnimation();
     }
@@ -536,7 +644,7 @@ public class CurlView extends View {
 
         if (mCurl.isAnimatingRelease) {
             float dist = (float) Math.hypot(mCurl.targetX - mCurl.curX, mCurl.targetY - mCurl.curY);
-            if (dist < 1.8f && speed < 15f) {
+            if (dist < 2.0f && speed < 18f) {
                 if (mCurl.completeFlipOnFinish) {
                     mCurrentIndex = mCurl.targetIndexAfterFlip;
                     invalidateCaches();
@@ -578,23 +686,38 @@ public class CurlView extends View {
         FoldGeometry g = new FoldGeometry();
         double W = mPageW;
         double H = mPageH;
+        int side = mCurl.side;
 
-        double px = Math.max(-W, Math.min(W - 1, mCurl.curX));
+        double xFoldCenter;
+        double liftDist;
+        double distToSpine;
+
+        if (side == 1) {
+            // Next page: spine at 0, edge at W
+            double px = Math.max(-W, Math.min(W - 1, mCurl.curX));
+            xFoldCenter = Math.max(0.001, Math.min(W - 0.5, (W + px) * 0.5));
+            liftDist = W - xFoldCenter;
+            distToSpine = xFoldCenter;
+        } else {
+            // Prev page: spine at W, edge at 0
+            double px = Math.max(1, Math.min(2 * W, mCurl.curX));
+            xFoldCenter = Math.max(0.5, Math.min(W - 0.001, px * 0.5));
+            liftDist = xFoldCenter;
+            distToSpine = W - xFoldCenter;
+        }
+
         double py = mCurl.curY;
         double gy = mCurl.grabY;
-
-        double xFoldCenter = Math.max(0.001, Math.min(W - 0.5, (W + px) * 0.5));
-        double liftDist = W - xFoldCenter;
 
         double verticalPull = (py - gy) * 0.85 + gy * (liftDist / W < 0.45 ? 0.95 : 0.45);
         double desiredTau = -verticalPull * (0.65 + 0.35 * mConfig.softness);
 
-        // Dynamic Spine Tau Clamping (|tau| <= xFoldCenter * 0.96)
-        double maxSpineTau = xFoldCenter * 0.96;
+        // Dynamic Spine Tau Clamping
+        double maxSpineTau = distToSpine * 0.96;
         double tau = Math.max(-maxSpineTau, Math.min(maxSpineTau, desiredTau));
 
         double len = Math.hypot(H * 0.5, tau);
-        double nx = (H * 0.5) / len;
+        double nx = (side == 1) ? ((H * 0.5) / len) : (-(H * 0.5) / len);
         double ny = tau / len;
 
         g.fx = xFoldCenter;
@@ -764,7 +887,7 @@ public class CurlView extends View {
         if (mViewMode == SHOW_TWO_PAGES) {
             canvas.translate(getWidth() / 2f, getHeight() / 2f);
         } else {
-            // Fullscreen single page: spine is at left edge x = 0
+            // Fullscreen single page: starts at x = 0
             canvas.translate(0f, getHeight() / 2f);
         }
 
@@ -788,14 +911,6 @@ public class CurlView extends View {
 
         // Active 2.5D RealisticBookEngine Curl
         int side = mCurl.side;
-        boolean mirrorSingle = (mViewMode == SHOW_ONE_PAGE && side == -1);
-
-        if (mirrorSingle) {
-            canvas.save();
-            canvas.translate(W, 0f);
-            canvas.scale(-1f, 1f);
-        }
-
         FoldGeometry geom = computeFoldGeometry();
         double fx = geom.fx, fy = geom.fy, nx = geom.nx, ny = geom.ny;
         double curlRadius = geom.curlRadius, archFactor = geom.archFactor;
@@ -920,7 +1035,7 @@ public class CurlView extends View {
                     },
                     new float[]{ 0f, 0.5f, 1f },
                     Shader.TileMode.CLAMP
-            );
+                );
             mGradPaint.setShader(castGrad);
             canvas.drawPath(shadowPath, mGradPaint);
             canvas.restore();
@@ -949,11 +1064,12 @@ public class CurlView extends View {
             mTempMatrix.postTranslate((float) fx, (float) fy);
             canvas.concat(mTempMatrix);
 
-            // Draw mirrored back page
+            // Draw mirrored back page across its horizontal center
             canvas.save();
-            canvas.translate(W, -H / 2f);
+            canvas.translate(W / 2f, 0f);
             canvas.scale(-1f, 1f);
-            drawPageBitmap(canvas, backBmp, new RectF(0, 0, W, H));
+            canvas.translate(-W / 2f, 0f);
+            drawPageBitmap(canvas, backBmp, new RectF(0, -H / 2f, W, H / 2f));
             canvas.restore();
 
             canvas.restore(); // restore Householder
@@ -980,10 +1096,6 @@ public class CurlView extends View {
             canvas.drawPath(flapPath, mEdgePaint);
 
             canvas.restore(); // restore flap clip
-        }
-
-        if (mirrorSingle) {
-            canvas.restore();
         }
 
         canvas.restore(); // restore bookCenter
