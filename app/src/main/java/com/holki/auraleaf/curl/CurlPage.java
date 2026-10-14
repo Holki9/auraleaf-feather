@@ -122,6 +122,10 @@ public class CurlPage {
 		return mTextureBack != null && !mTextureBack.equals(mTextureFront);
 	}
 
+	public Bitmap getRawTexture(int side) {
+		return side == SIDE_FRONT ? mTextureFront : mTextureBack;
+	}
+
 	public void recycle() {
 		mTextureFront = null;
 		mTextureBack = null;
