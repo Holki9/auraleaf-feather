@@ -1,0 +1,1238 @@
+/*
+   Copyright 2012 Harri Smatt
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+ */
+
+package com.holki.auraleaf.curl;
+
+import android.content.Context;
+import android.graphics.PixelFormat;
+import android.graphics.PointF;
+import android.graphics.RectF;
+import android.opengl.GLSurfaceView;
+import android.util.AttributeSet;
+import android.view.GestureDetector;
+import android.view.MotionEvent;
+import android.view.ScaleGestureDetector;
+import android.view.View;
+import android.view.ViewConfiguration;
+import com.holki.auraleaf.SoundHelper;
+
+/**
+ * OpenGL ES View.
+ * 
+ * @author harism
+ */
+public class CurlView extends GLSurfaceView implements View.OnTouchListener,
+		CurlRenderer.Observer {
+
+	public interface OnPageListener {
+		void onPageChanged(int newPageIndex);
+	}
+
+	public interface OnTapListener {
+		void onSingleTap();
+		void onDoubleTap();
+	}
+
+	private OnPageListener mPageListener;
+	private OnTapListener mTapListener;
+	private SoundHelper mSoundHelper;
+	private com.holki.auraleaf.HapticHelper mHapticHelper;
+
+	// Gesture & Tap tracking
+	private GestureDetector mGestureDetector;
+	private float mDownScreenX = 0f;
+	private float mDownScreenY = 0f;
+	private boolean mIsDragging = false;
+	private float mTouchSlop = 48f;
+
+	// Zoom & Pan
+	private ScaleGestureDetector mScaleDetector;
+	private float mZoomScale = 1.0f;
+	private float mPanX = 0f;
+	private float mPanY = 0f;
+	private float mLastPanX = 0f;
+	private float mLastPanY = 0f;
+
+	// Feather-Light Tracking & Amplification
+	private PointF mTargetPointerPos = new PointF();
+	private PointF mCurrentPointerPos = new PointF();
+	private long mLastTrackingTime = 0;
+	private android.view.VelocityTracker mVelocityTracker = null;
+	private int mLockedCurlDirection = 0;
+	private static final float SWIPE_GAIN = 1.35f;
+
+	// Curl state. We are flipping none, left or right page.
+	private static final int CURL_LEFT = 1;
+	private static final int CURL_NONE = 0;
+	private static final int CURL_RIGHT = 2;
+
+	// Constants for mAnimationTargetEvent.
+	private static final int SET_CURL_TO_LEFT = 1;
+	private static final int SET_CURL_TO_RIGHT = 2;
+
+	// Shows one page at the center of view.
+	public static final int SHOW_ONE_PAGE = 1;
+	// Shows two pages side by side.
+	public static final int SHOW_TWO_PAGES = 2;
+
+	private boolean mAllowLastPageCurl = true;
+
+	private boolean mAnimate = false;
+	private long mAnimationDurationTime = 300;
+	private PointF mAnimationSource = new PointF();
+	private long mAnimationStartTime;
+	private PointF mAnimationTarget = new PointF();
+	private int mAnimationTargetEvent;
+
+	private PointF mCurlDir = new PointF();
+
+	private PointF mCurlPos = new PointF();
+	private int mCurlState = CURL_NONE;
+	// Current bitmap index. This is always showed as front of right page.
+	private int mCurrentIndex = 0;
+
+	// Start position for dragging.
+	private PointF mDragStartPos = new PointF();
+
+	private boolean mEnableTouchPressure = false;
+	// Bitmap size. These are updated from renderer once it's initialized.
+	private int mPageBitmapHeight = -1;
+
+	private int mPageBitmapWidth = -1;
+	// Page meshes. Left and right meshes are 'static' while curl is used to
+	// show page flipping.
+	private CurlMesh mPageCurl;
+
+	private CurlMesh mPageLeft;
+	private PageProvider mPageProvider;
+	private CurlMesh mPageRight;
+
+	private PointerPosition mPointerPos = new PointerPosition();
+
+	private CurlRenderer mRenderer;
+	private boolean mRenderLeftPage = false;
+	private SizeChangedObserver mSizeChangedObserver;
+
+	// One page is the default.
+	private int mViewMode = SHOW_ONE_PAGE;
+
+	/**
+	 * Default constructor.
+	 */
+	public CurlView(Context ctx) {
+		super(ctx);
+		init(ctx);
+	}
+
+	/**
+	 * Default constructor.
+	 */
+	public CurlView(Context ctx, AttributeSet attrs) {
+		super(ctx, attrs);
+		init(ctx);
+	}
+
+	/**
+	 * Default constructor.
+	 */
+	public CurlView(Context ctx, AttributeSet attrs, int defStyle) {
+		this(ctx, attrs);
+	}
+
+	/**
+	 * Get current page index. Page indices are zero based values presenting
+	 * page being shown on right side of the book.
+	 */
+	public int getCurrentIndex() {
+		return mCurrentIndex;
+	}
+
+	/**
+	 * Initialize method.
+	 */
+	private void init(Context ctx) {
+		mRenderer = new CurlRenderer(this);
+		setEGLConfigChooser(8, 8, 8, 8, 16, 0);
+		getHolder().setFormat(PixelFormat.TRANSLUCENT);
+		setRenderer(mRenderer);
+		setRenderMode(GLSurfaceView.RENDERMODE_WHEN_DIRTY);
+		setOnTouchListener(this);
+
+		mTouchSlop = ViewConfiguration.get(ctx).getScaledTouchSlop() * 1.5f;
+
+		mGestureDetector = new GestureDetector(ctx, new GestureDetector.SimpleOnGestureListener() {
+			@Override
+			public boolean onSingleTapConfirmed(MotionEvent e) {
+				if (!mIsDragging && mCurlState == CURL_NONE && mTapListener != null) {
+					android.util.Log.d("CurlView", "Single tap confirmed via GestureDetector");
+					mTapListener.onSingleTap();
+				}
+				return true;
+			}
+
+			@Override
+			public boolean onDoubleTap(MotionEvent e) {
+				android.util.Log.d("CurlView", "Double tap detected via GestureDetector");
+				resetZoom();
+				if (mTapListener != null) {
+					mTapListener.onDoubleTap();
+				}
+				return true;
+			}
+		});
+
+		mScaleDetector = new ScaleGestureDetector(ctx, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+			@Override
+			public boolean onScale(ScaleGestureDetector detector) {
+				float factor = detector.getScaleFactor();
+				float prevScale = mZoomScale;
+				mZoomScale = Math.max(1.0f, Math.min(3.5f, mZoomScale * factor));
+
+				// Keep focal point stationary while scaling
+				if (prevScale != mZoomScale && getWidth() > 0 && getHeight() > 0) {
+					float ratio = (float) getWidth() / getHeight();
+					float fx = (detector.getFocusX() / getWidth() * 2f - 1f) * ratio;
+					float fy = -(detector.getFocusY() / getHeight() * 2f - 1f);
+
+					mPanX += fx * (1f / mZoomScale - 1f / prevScale);
+					mPanY += fy * (1f / mZoomScale - 1f / prevScale);
+				}
+
+				if (mZoomScale <= 1.05f) {
+					mZoomScale = 1.0f;
+					mPanX = 0f;
+					mPanY = 0f;
+				} else {
+					clampPan();
+				}
+
+				updateMeshVisibilityForZoom();
+				mRenderer.setZoom(mZoomScale, mPanX, mPanY);
+				requestRender();
+				return true;
+			}
+		});
+		mScaleDetector.setQuickScaleEnabled(false);
+
+		// Even though left and right pages are static we have to allocate room
+		// for curl on them too as we are switching meshes. Another way would be
+		// to swap texture ids only.
+		mPageLeft = new CurlMesh(10);
+		mPageRight = new CurlMesh(10);
+		mPageCurl = new CurlMesh(10);
+		mPageLeft.setFlipTexture(true);
+		mPageRight.setFlipTexture(false);
+	}
+
+	private void clampPan() {
+		if (getWidth() <= 0 || getHeight() <= 0) return;
+		float ratio = (float) getWidth() / getHeight();
+		float maxPanX = ratio * (1.0f - 1.0f / mZoomScale);
+		float maxPanY = 1.0f * (1.0f - 1.0f / mZoomScale);
+		mPanX = Math.max(-maxPanX, Math.min(maxPanX, mPanX));
+		mPanY = Math.max(-maxPanY, Math.min(maxPanY, mPanY));
+	}
+
+	private void updateMeshVisibilityForZoom() {
+		boolean isZoomed = mZoomScale > 1.05f;
+		if (mPageLeft != null) {
+			mPageLeft.setVisible(!isZoomed);
+		}
+		if (mPageCurl != null) {
+			mPageCurl.setVisible(!isZoomed);
+		}
+	}
+
+	@Override
+	public void onDrawFrame() {
+		// We are not animating.
+		if (mAnimate == false) {
+			return;
+		}
+
+		long currentTime = System.currentTimeMillis();
+		// If animation is done.
+		if (currentTime >= mAnimationStartTime + mAnimationDurationTime) {
+			int oldIndex = mCurrentIndex;
+			if (mAnimationTargetEvent == SET_CURL_TO_RIGHT) {
+				// Switch curled page to right.
+				CurlMesh right = mPageCurl;
+				CurlMesh curl = mPageRight;
+				right.setRect(mRenderer.getPageRect(CurlRenderer.PAGE_RIGHT));
+				right.setFlipTexture(false);
+				right.reset();
+				mRenderer.removeCurlMesh(curl);
+				mPageCurl = curl;
+				mPageRight = right;
+				// If we were curling left page update current index.
+				if (mCurlState == CURL_LEFT) {
+					--mCurrentIndex;
+				}
+			} else if (mAnimationTargetEvent == SET_CURL_TO_LEFT) {
+				// Switch curled page to left.
+				CurlMesh left = mPageCurl;
+				CurlMesh curl = mPageLeft;
+				left.setRect(mRenderer.getPageRect(CurlRenderer.PAGE_LEFT));
+				left.setFlipTexture(true);
+				left.reset();
+				mRenderer.removeCurlMesh(curl);
+				if (!mRenderLeftPage) {
+					mRenderer.removeCurlMesh(left);
+				}
+				mPageCurl = curl;
+				mPageLeft = left;
+				// If we were curling right page update current index.
+				if (mCurlState == CURL_RIGHT) {
+					++mCurrentIndex;
+				}
+			}
+			mCurlState = CURL_NONE;
+			mAnimate = false;
+			if (oldIndex != mCurrentIndex) {
+				if (mSoundHelper != null) {
+					mSoundHelper.playFlip();
+				}
+				if (mHapticHelper != null) {
+					mHapticHelper.vibratePageFlip();
+				}
+				if (mPageListener != null) {
+					final int newIdx = mCurrentIndex;
+					post(() -> mPageListener.onPageChanged(newIdx));
+				}
+			}
+			requestRender();
+		} else {
+			float progress = (float) (currentTime - mAnimationStartTime) / mAnimationDurationTime;
+			progress = Math.max(0f, Math.min(1f, progress));
+			float inv = 1.0f - progress;
+			float t = 1.0f - (inv * inv * inv);
+			mPointerPos.mPos.x = mAnimationSource.x + (mAnimationTarget.x - mAnimationSource.x) * t;
+			mPointerPos.mPos.y = mAnimationSource.y + (mAnimationTarget.y - mAnimationSource.y) * t;
+			updateCurlPos(mPointerPos);
+		}
+	}
+
+	@Override
+	public void onPageSizeChanged(int width, int height) {
+		mPageBitmapWidth = width;
+		mPageBitmapHeight = height;
+		updatePages();
+		requestRender();
+	}
+
+	public void reloadPages() {
+		updatePages();
+		requestRender();
+	}
+
+	@Override
+	public void onSizeChanged(int w, int h, int ow, int oh) {
+		super.onSizeChanged(w, h, ow, oh);
+		requestRender();
+		if (mSizeChangedObserver != null) {
+			mSizeChangedObserver.onSizeChanged(w, h);
+		}
+	}
+
+	@Override
+	public void onSurfaceCreated() {
+		// In case surface is recreated, let page meshes drop allocated texture
+		// ids and ask for new ones. There's no need to set textures here as
+		// onPageSizeChanged should be called later on.
+		mPageLeft.resetTexture();
+		mPageRight.resetTexture();
+		mPageCurl.resetTexture();
+	}
+
+	public void setSoundHelper(SoundHelper helper) {
+		mSoundHelper = helper;
+	}
+
+	public void setHapticHelper(com.holki.auraleaf.HapticHelper helper) {
+		mHapticHelper = helper;
+	}
+
+	public void setOnPageListener(OnPageListener listener) {
+		mPageListener = listener;
+	}
+
+	public void setOnTapListener(OnTapListener listener) {
+		mTapListener = listener;
+	}
+
+	public void resetZoom() {
+		mZoomScale = 1.0f;
+		mPanX = 0f;
+		mPanY = 0f;
+		updateMeshVisibilityForZoom();
+		if (mRenderer != null) {
+			mRenderer.setZoom(1.0f, 0f, 0f);
+			requestRender();
+		}
+	}
+
+	public boolean isZoomed() {
+		return mZoomScale > 1.05f;
+	}
+
+	public float getZoomScale() {
+		return mZoomScale;
+	}
+
+	public void flipNext() {
+		if (mAnimate || mPageProvider == null) return;
+		if (mViewMode == SHOW_TWO_PAGES) {
+			int total = mPageProvider.getPageCount();
+			int nextIdx;
+			if (mCurrentIndex == 0) {
+				nextIdx = 1;
+			} else {
+				int leftIdx = (mCurrentIndex % 2 == 1) ? mCurrentIndex : mCurrentIndex - 1;
+				nextIdx = leftIdx + 2;
+			}
+			if (nextIdx >= total) return;
+			mCurrentIndex = nextIdx;
+			if (mSoundHelper != null) mSoundHelper.playFlip();
+			if (mHapticHelper != null) mHapticHelper.vibratePageFlip();
+			updatePages();
+			if (mPageListener != null) {
+				final int idx = mCurrentIndex;
+				post(() -> mPageListener.onPageChanged(idx));
+			}
+			requestRender();
+			return;
+		}
+
+		if (mCurrentIndex >= mPageProvider.getPageCount() - 1) return;
+		RectF rightRect = mRenderer.getPageRect(CurlRenderer.PAGE_RIGHT);
+		mDragStartPos.set(rightRect.right, 0f);
+		startCurl(CURL_RIGHT);
+		mPointerPos.mPos.set(rightRect.right, 0f);
+		updateCurlPos(mPointerPos);
+		mAnimationSource.set(rightRect.right, 0f);
+		mAnimationTarget.set(rightRect.left, 0f);
+		mAnimationTargetEvent = SET_CURL_TO_LEFT;
+		mAnimationStartTime = System.currentTimeMillis();
+		mAnimationDurationTime = 230;
+		mAnimate = true;
+		requestRender();
+	}
+
+	public void flipPrev() {
+		if (mAnimate || mPageProvider == null) return;
+		if (mViewMode == SHOW_TWO_PAGES) {
+			if (mCurrentIndex <= 0) return;
+			int prevIdx;
+			if (mCurrentIndex <= 2) {
+				prevIdx = 0; // Return to cover
+			} else {
+				int leftIdx = (mCurrentIndex % 2 == 1) ? mCurrentIndex : mCurrentIndex - 1;
+				prevIdx = Math.max(0, leftIdx - 2);
+			}
+			mCurrentIndex = prevIdx;
+			if (mSoundHelper != null) mSoundHelper.playFlip();
+			if (mHapticHelper != null) mHapticHelper.vibratePageFlip();
+			updatePages();
+			if (mPageListener != null) {
+				final int idx = mCurrentIndex;
+				post(() -> mPageListener.onPageChanged(idx));
+			}
+			requestRender();
+			return;
+		}
+
+		if (mCurrentIndex <= 0) return;
+		RectF rightRect = mRenderer.getPageRect(CurlRenderer.PAGE_RIGHT);
+		mDragStartPos.set(rightRect.left, 0f);
+		startCurl(CURL_LEFT);
+		mPointerPos.mPos.set(rightRect.left, 0f);
+		updateCurlPos(mPointerPos);
+		mAnimationSource.set(rightRect.left, 0f);
+		mAnimationTarget.set(rightRect.right, 0f);
+		mAnimationTargetEvent = SET_CURL_TO_RIGHT;
+		mAnimationStartTime = System.currentTimeMillis();
+		mAnimationDurationTime = 230;
+		mAnimate = true;
+		requestRender();
+	}
+
+	@Override
+	public boolean onTouch(View view, MotionEvent me) {
+		if (mAnimate || mPageProvider == null) {
+			return false;
+		}
+
+		if (mGestureDetector != null) {
+			mGestureDetector.onTouchEvent(me);
+		}
+
+		if (mScaleDetector != null) {
+			mScaleDetector.onTouchEvent(me);
+		}
+
+		int action = me.getActionMasked();
+		if (action == MotionEvent.ACTION_POINTER_UP) {
+			int upIndex = me.getActionIndex();
+			int activeIndex = (upIndex == 0) ? 1 : 0;
+			mLastPanX = me.getX(activeIndex);
+			mLastPanY = me.getY(activeIndex);
+			return true;
+		}
+
+		if (mScaleDetector != null && mScaleDetector.isInProgress()) {
+			mIsDragging = false;
+			mLastPanX = me.getX();
+			mLastPanY = me.getY();
+			return true;
+		}
+
+		if (me.getPointerCount() > 1) {
+			// Multi-touch: prevent curl drag and jumping
+			mIsDragging = false;
+			int upIndex = me.getActionIndex();
+			int activeIndex = (action == MotionEvent.ACTION_POINTER_UP && upIndex == 0) ? 1 : 0;
+			mLastPanX = me.getX(activeIndex);
+			mLastPanY = me.getY(activeIndex);
+			return true;
+		}
+
+		RectF rightRect = mRenderer.getPageRect(CurlRenderer.PAGE_RIGHT);
+		RectF leftRect = mRenderer.getPageRect(CurlRenderer.PAGE_LEFT);
+
+		mPointerPos.mPos.set(me.getX(), me.getY());
+		mRenderer.translate(mPointerPos.mPos);
+		mPointerPos.mPressure = mEnableTouchPressure ? me.getPressure() : 0.8f;
+
+		switch (me.getAction() & MotionEvent.ACTION_MASK) {
+		case MotionEvent.ACTION_DOWN: {
+			mDownScreenX = me.getX();
+			mDownScreenY = me.getY();
+			mLastPanX = me.getX();
+			mLastPanY = me.getY();
+			mIsDragging = false;
+			mCurlState = CURL_NONE;
+			mLockedCurlDirection = CURL_NONE;
+
+			if (mVelocityTracker == null) {
+				mVelocityTracker = android.view.VelocityTracker.obtain();
+			} else {
+				mVelocityTracker.clear();
+			}
+			mVelocityTracker.addMovement(me);
+
+			mLastTrackingTime = System.nanoTime();
+			mCurrentPointerPos.set(me.getX(), me.getY());
+			mRenderer.translate(mCurrentPointerPos);
+			mTargetPointerPos.set(mCurrentPointerPos);
+			mPointerPos.mPos.set(mCurrentPointerPos);
+			mPointerPos.mPressure = mEnableTouchPressure ? me.getPressure() : 0.8f;
+			return true;
+		}
+
+		case MotionEvent.ACTION_MOVE: {
+			if (mVelocityTracker != null) {
+				mVelocityTracker.addMovement(me);
+			}
+
+			if (mZoomScale > 1.05f) {
+				float ratio = (float) Math.max(1, getWidth()) / Math.max(1, getHeight());
+				float dx = (me.getX() - mLastPanX) / (float) Math.max(1, getWidth()) * 2f * ratio;
+				float dy = -(me.getY() - mLastPanY) / (float) Math.max(1, getHeight()) * 2f;
+				mLastPanX = me.getX();
+				mLastPanY = me.getY();
+				mPanX += dx / mZoomScale;
+				mPanY += dy / mZoomScale;
+				clampPan();
+				mRenderer.setZoom(mZoomScale, mPanX, mPanY);
+				requestRender();
+				return true;
+			}
+
+			float rawDx = me.getX() - mDownScreenX;
+			float rawDy = me.getY() - mDownScreenY;
+			float absDx = Math.abs(rawDx);
+			float absDy = Math.abs(rawDy);
+
+			if (!mIsDragging) {
+				if (absDx < mTouchSlop && absDy < mTouchSlop) {
+					return true;
+				}
+				// Vertical swipe: strictly prohibited from turning pages
+				if (absDy > absDx * 1.25f) {
+					return true;
+				}
+
+				mIsDragging = true;
+				if (mViewMode == SHOW_TWO_PAGES) {
+					if (rawDx < 0) {
+						flipNext();
+					} else {
+						flipPrev();
+					}
+					return true;
+				}
+
+				if (rawDx < 0) {
+					// Swiping left -> Turn NEXT page forward!
+					if (mCurrentIndex < mPageProvider.getPageCount() - 1) {
+						mLockedCurlDirection = CURL_RIGHT;
+						mDragStartPos.set(mCurrentPointerPos);
+						mDragStartPos.x = rightRect.right;
+						mDragStartPos.y = mCurrentPointerPos.y;
+						startCurl(CURL_RIGHT);
+					} else {
+						return true;
+					}
+				} else {
+					// Swiping right -> Turn PREVIOUS page backward!
+					if (mCurrentIndex > 0) {
+						mLockedCurlDirection = CURL_LEFT;
+						mDragStartPos.set(mCurrentPointerPos);
+						mDragStartPos.x = rightRect.left;
+						mDragStartPos.y = mCurrentPointerPos.y;
+						startCurl(CURL_LEFT);
+					} else {
+						return true;
+					}
+				}
+			}
+
+			// Swipe Amplification (Gain = 1.35x)
+			float amplifiedDx = rawDx * SWIPE_GAIN;
+			float virtScreenX = mDownScreenX + amplifiedDx;
+			float virtScreenY = me.getY();
+
+			mTargetPointerPos.set(virtScreenX, virtScreenY);
+			mRenderer.translate(mTargetPointerPos);
+
+			// Real-time exponential interpolation: currentPos += (targetPos - currentPos) * 0.32
+			long now = System.nanoTime();
+			float dt = (mLastTrackingTime > 0) ? (now - mLastTrackingTime) / 1_000_000_000f : 0.016f;
+			mLastTrackingTime = now;
+
+			float alpha = 1.0f - (float) Math.pow(1.0 - 0.32, Math.max(0.001f, dt) * 60.0f);
+			alpha = Math.max(0.20f, Math.min(0.95f, alpha));
+
+			mCurrentPointerPos.x += (mTargetPointerPos.x - mCurrentPointerPos.x) * alpha;
+			mCurrentPointerPos.y += (mTargetPointerPos.y - mCurrentPointerPos.y) * alpha;
+
+			mPointerPos.mPos.set(mCurrentPointerPos);
+			mPointerPos.mPressure = mEnableTouchPressure ? me.getPressure() : 0.8f;
+
+			if (mCurlState != CURL_NONE) {
+				updateCurlPos(mPointerPos);
+			}
+			return true;
+		}
+
+		case MotionEvent.ACTION_CANCEL:
+		case MotionEvent.ACTION_UP: {
+			float vx = 0f;
+			if (mVelocityTracker != null) {
+				mVelocityTracker.addMovement(me);
+				mVelocityTracker.computeCurrentVelocity(1000);
+				vx = mVelocityTracker.getXVelocity();
+				mVelocityTracker.recycle();
+				mVelocityTracker = null;
+			}
+
+			if (!mIsDragging) {
+				mCurlState = CURL_NONE;
+				mLockedCurlDirection = CURL_NONE;
+				return true;
+			}
+
+			mIsDragging = false;
+			if (mCurlState == CURL_LEFT || mCurlState == CURL_RIGHT) {
+				mAnimationSource.set(mPointerPos.mPos);
+				mAnimationStartTime = System.currentTimeMillis();
+				mAnimationDurationTime = 230; // 230ms fast, fluttering snap
+
+				if (mCurlState == CURL_RIGHT) {
+					// Low threshold: 25% of page width OR quick swipe velocity
+					float threshold = rightRect.right - (rightRect.width() * 0.25f);
+					if (mPointerPos.mPos.x < threshold || vx < -350f) {
+						mAnimationTarget.set(mDragStartPos);
+						mAnimationTarget.x = rightRect.left;
+						mAnimationTargetEvent = SET_CURL_TO_LEFT;
+					} else {
+						mAnimationTarget.set(mDragStartPos);
+						mAnimationTarget.x = rightRect.right;
+						mAnimationTargetEvent = SET_CURL_TO_RIGHT;
+					}
+				} else { // CURL_LEFT
+					// Low threshold: 25% of page width OR quick swipe velocity
+					float threshold = rightRect.left + (rightRect.width() * 0.25f);
+					if (mPointerPos.mPos.x > threshold || vx > 350f) {
+						mAnimationTarget.set(mDragStartPos);
+						mAnimationTarget.x = rightRect.right;
+						mAnimationTargetEvent = SET_CURL_TO_RIGHT;
+					} else {
+						mAnimationTarget.set(mDragStartPos);
+						mAnimationTarget.x = rightRect.left;
+						mAnimationTargetEvent = SET_CURL_TO_LEFT;
+					}
+				}
+				mAnimate = true;
+				requestRender();
+			}
+			mLockedCurlDirection = CURL_NONE;
+			break;
+		}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Allow the last page to curl.
+	 */
+	public void setAllowLastPageCurl(boolean allowLastPageCurl) {
+		mAllowLastPageCurl = allowLastPageCurl;
+	}
+
+	/**
+	 * Sets background color - or OpenGL clear color to be more precise. Color
+	 * is a 32bit value consisting of 0xAARRGGBB and is extracted using
+	 * android.graphics.Color eventually.
+	 */
+	@Override
+	public void setBackgroundColor(int color) {
+		mRenderer.setBackgroundColor(color);
+		requestRender();
+	}
+
+	/**
+	 * Sets mPageCurl curl position.
+	 */
+	private void setCurlPos(PointF curlPos, PointF curlDir, double radius) {
+		// Prevent corner snapping by smoothly constraining tilt
+		float maxTilt = Math.abs(curlDir.x) * 0.25f;
+		if (maxTilt > 0) {
+			curlDir.y = Math.max(-maxTilt, Math.min(maxTilt, curlDir.y * 0.15f));
+		}
+		if (Math.abs(curlDir.y) < 0.04f) {
+			curlDir.y = 0f;
+		}
+
+		// Spine Dual-Radius constraint (radius = pageWidth from top and bottom spine corners)
+		RectF activePageRect = (mCurlState == CURL_RIGHT || mViewMode == SHOW_ONE_PAGE)
+				? mRenderer.getPageRect(CurlRenderer.PAGE_RIGHT)
+				: mRenderer.getPageRect(CurlRenderer.PAGE_LEFT);
+		float activeWidth = activePageRect.width();
+		float spineX = (mCurlState == CURL_RIGHT || mViewMode == SHOW_ONE_PAGE)
+				? activePageRect.left : activePageRect.right;
+
+		float dTopX = curlPos.x - spineX;
+		float dTopY = curlPos.y - activePageRect.top;
+		float distTop = (float) Math.hypot(dTopX, dTopY);
+		if (distTop > activeWidth && distTop > 0) {
+			curlPos.x = spineX + (dTopX / distTop) * activeWidth;
+			curlPos.y = activePageRect.top + (dTopY / distTop) * activeWidth;
+		}
+
+		float dBotX = curlPos.x - spineX;
+		float dBotY = curlPos.y - activePageRect.bottom;
+		float distBot = (float) Math.hypot(dBotX, dBotY);
+		if (distBot > activeWidth && distBot > 0) {
+			curlPos.x = spineX + (dBotX / distBot) * activeWidth;
+			curlPos.y = activePageRect.bottom + (dBotY / distBot) * activeWidth;
+		}
+
+		// First reposition curl so that page doesn't 'rip off' from book.
+		if (mCurlState == CURL_RIGHT
+				|| (mCurlState == CURL_LEFT && mViewMode == SHOW_ONE_PAGE)) {
+			RectF pageRect = mRenderer.getPageRect(CurlRenderer.PAGE_RIGHT);
+			if (curlPos.x >= pageRect.right) {
+				mPageCurl.reset();
+				requestRender();
+				return;
+			}
+			if (curlPos.x < pageRect.left) {
+				curlPos.x = pageRect.left;
+			}
+			if (curlDir.y != 0) {
+				float diffX = curlPos.x - pageRect.left;
+				float leftY = curlPos.y + (diffX * curlDir.x / curlDir.y);
+				if (curlDir.y < 0 && leftY < pageRect.top) {
+					curlDir.x = curlPos.y - pageRect.top;
+					curlDir.y = pageRect.left - curlPos.x;
+				} else if (curlDir.y > 0 && leftY > pageRect.bottom) {
+					curlDir.x = pageRect.bottom - curlPos.y;
+					curlDir.y = curlPos.x - pageRect.left;
+				}
+			}
+		} else if (mCurlState == CURL_LEFT) {
+			RectF pageRect = mRenderer.getPageRect(CurlRenderer.PAGE_LEFT);
+			if (curlPos.x <= pageRect.left) {
+				mPageCurl.reset();
+				requestRender();
+				return;
+			}
+			if (curlPos.x > pageRect.right) {
+				curlPos.x = pageRect.right;
+			}
+			if (curlDir.y != 0) {
+				float diffX = curlPos.x - pageRect.right;
+				float rightY = curlPos.y + (diffX * curlDir.x / curlDir.y);
+				if (curlDir.y < 0 && rightY < pageRect.top) {
+					curlDir.x = pageRect.top - curlPos.y;
+					curlDir.y = curlPos.x - pageRect.right;
+				} else if (curlDir.y > 0 && rightY > pageRect.bottom) {
+					curlDir.x = curlPos.y - pageRect.bottom;
+					curlDir.y = pageRect.right - curlPos.x;
+				}
+			}
+		}
+
+		// Finally normalize direction vector and do rendering.
+		double dist = Math.sqrt(curlDir.x * curlDir.x + curlDir.y * curlDir.y);
+		if (dist != 0) {
+			curlDir.x /= dist;
+			curlDir.y /= dist;
+			mPageCurl.curl(curlPos, curlDir, radius);
+		} else {
+			mPageCurl.reset();
+		}
+
+		requestRender();
+	}
+
+	/**
+	 * Set current page index. Page indices are zero based values presenting
+	 * page being shown on right side of the book. E.g if you set value to 4;
+	 * right side front facing bitmap will be with index 4, back facing 5 and
+	 * for left side page index 3 is front facing, and index 2 back facing (once
+	 * page is on left side it's flipped over).
+	 * 
+	 * Current index is rounded to closest value divisible with 2.
+	 */
+	public void setCurrentIndex(int index) {
+		if (mPageProvider == null || index < 0) {
+			mCurrentIndex = 0;
+		} else {
+			if (mAllowLastPageCurl) {
+				mCurrentIndex = Math.min(index, mPageProvider.getPageCount());
+			} else {
+				mCurrentIndex = Math.min(index,
+						mPageProvider.getPageCount() - 1);
+			}
+		}
+		updatePages();
+		requestRender();
+	}
+
+	/**
+	 * If set to true, touch event pressure information is used to adjust curl
+	 * radius. The more you press, the flatter the curl becomes. This is
+	 * somewhat experimental and results may vary significantly between devices.
+	 * On emulator pressure information seems to be flat 1.0f which is maximum
+	 * value and therefore not very much of use.
+	 */
+	public void setEnableTouchPressure(boolean enableTouchPressure) {
+		mEnableTouchPressure = enableTouchPressure;
+	}
+
+	/**
+	 * Set margins (or padding). Note: margins are proportional. Meaning a value
+	 * of .1f will produce a 10% margin.
+	 */
+	public void setMargins(float left, float top, float right, float bottom) {
+		mRenderer.setMargins(left, top, right, bottom);
+	}
+
+	/**
+	 * Update/set page provider.
+	 */
+	public void setPageProvider(PageProvider pageProvider) {
+		mPageProvider = pageProvider;
+		mCurrentIndex = 0;
+		updatePages();
+		requestRender();
+	}
+
+	/**
+	 * Setter for whether left side page is rendered. This is useful mostly for
+	 * situations where right (main) page is aligned to left side of screen and
+	 * left page is not visible anyway.
+	 */
+	public void setRenderLeftPage(boolean renderLeftPage) {
+		mRenderLeftPage = renderLeftPage;
+	}
+
+	/**
+	 * Sets SizeChangedObserver for this View. Call back method is called from
+	 * this View's onSizeChanged method.
+	 */
+	public void setSizeChangedObserver(SizeChangedObserver observer) {
+		mSizeChangedObserver = observer;
+	}
+
+	public int getViewMode() {
+		return mViewMode;
+	}
+
+	/**
+	 * Sets view mode. Value can be either SHOW_ONE_PAGE or SHOW_TWO_PAGES. In
+	 * former case right page is made size of display, and in latter case two
+	 * pages are laid on visible area.
+	 */
+	public void setViewMode(int viewMode) {
+		switch (viewMode) {
+		case SHOW_ONE_PAGE:
+			mViewMode = viewMode;
+			mRenderLeftPage = false;
+			mPageLeft.setFlipTexture(true);
+			mRenderer.setViewMode(CurlRenderer.SHOW_ONE_PAGE);
+			break;
+		case SHOW_TWO_PAGES:
+			mViewMode = viewMode;
+			mRenderLeftPage = true;
+			mPageLeft.setFlipTexture(false);
+			mPageRight.setFlipTexture(false);
+			mRenderer.setViewMode(CurlRenderer.SHOW_TWO_PAGES);
+			break;
+		}
+		if (mPageBitmapWidth > 0 && mPageBitmapHeight > 0) {
+			reloadPages();
+		}
+	}
+
+	/**
+	 * Switches meshes and loads new bitmaps if available. Updated to support 2
+	 * pages in landscape
+	 */
+	private void startCurl(int page) {
+		if (mHapticHelper != null) {
+			mHapticHelper.vibratePageTouch();
+		}
+		switch (page) {
+
+		// Once right side page is curled, first right page is assigned into
+		// curled page. And if there are more bitmaps available new bitmap is
+		// loaded into right side mesh.
+		case CURL_RIGHT: {
+			// Remove meshes from renderer.
+			mRenderer.removeCurlMesh(mPageLeft);
+			mRenderer.removeCurlMesh(mPageRight);
+			mRenderer.removeCurlMesh(mPageCurl);
+
+			// We are curling right page.
+			CurlMesh curl = mPageRight;
+			mPageRight = mPageCurl;
+			mPageCurl = curl;
+
+			if (mCurrentIndex > 0) {
+				mPageLeft.setFlipTexture(true);
+				mPageLeft
+						.setRect(mRenderer.getPageRect(CurlRenderer.PAGE_LEFT));
+				mPageLeft.reset();
+				if (mRenderLeftPage) {
+					mRenderer.addCurlMesh(mPageLeft);
+				}
+			}
+			if (mCurrentIndex < mPageProvider.getPageCount() - 1) {
+				updatePage(mPageRight.getTexturePage(), mCurrentIndex + 1);
+				mPageRight.setRect(mRenderer
+						.getPageRect(CurlRenderer.PAGE_RIGHT));
+				mPageRight.setFlipTexture(false);
+				mPageRight.reset();
+				mRenderer.addCurlMesh(mPageRight);
+			}
+
+			// Add curled page to renderer.
+			mPageCurl.setRect(mRenderer.getPageRect(CurlRenderer.PAGE_RIGHT));
+			mPageCurl.setFlipTexture(false);
+			mPageCurl.reset();
+			mRenderer.addCurlMesh(mPageCurl);
+
+			mCurlState = CURL_RIGHT;
+			break;
+		}
+
+		// On left side curl, left page is assigned to curled page. And if
+		// there are more bitmaps available before currentIndex, new bitmap
+		// is loaded into left page.
+		case CURL_LEFT: {
+			// Remove meshes from renderer.
+			mRenderer.removeCurlMesh(mPageLeft);
+			mRenderer.removeCurlMesh(mPageRight);
+			mRenderer.removeCurlMesh(mPageCurl);
+
+			// We are curling left page.
+			CurlMesh curl = mPageLeft;
+			mPageLeft = mPageCurl;
+			mPageCurl = curl;
+
+			if (mCurrentIndex > 1) {
+				updatePage(mPageLeft.getTexturePage(), mCurrentIndex - 2);
+				mPageLeft.setFlipTexture(true);
+				mPageLeft
+						.setRect(mRenderer.getPageRect(CurlRenderer.PAGE_LEFT));
+				mPageLeft.reset();
+				if (mRenderLeftPage) {
+					mRenderer.addCurlMesh(mPageLeft);
+				}
+			}
+
+			// If there is something to show on right page add it to renderer.
+			if (mCurrentIndex < mPageProvider.getPageCount()) {
+				mPageRight.setFlipTexture(false);
+				mPageRight.setRect(mRenderer
+						.getPageRect(CurlRenderer.PAGE_RIGHT));
+				mPageRight.reset();
+				mRenderer.addCurlMesh(mPageRight);
+			}
+
+			// How dragging previous page happens depends on view mode.
+			if (mViewMode == SHOW_ONE_PAGE
+					|| (mCurlState == CURL_LEFT && mViewMode == SHOW_TWO_PAGES)) {
+				mPageCurl.setRect(mRenderer
+						.getPageRect(CurlRenderer.PAGE_RIGHT));
+				mPageCurl.setFlipTexture(false);
+			} else {
+				mPageCurl
+						.setRect(mRenderer.getPageRect(CurlRenderer.PAGE_LEFT));
+				mPageCurl.setFlipTexture(true);
+			}
+			mPageCurl.reset();
+			mRenderer.addCurlMesh(mPageCurl);
+
+			mCurlState = CURL_LEFT;
+			break;
+		}
+
+		}
+	}
+
+	/**
+	 * Updates curl position.
+	 */
+	private void updateCurlPos(PointerPosition pointerPos) {
+
+		// Default curl radius: 2.5D Crisp Paper fold (minimal cylinder radius ~5.8% of page width)
+		float pageWidth = mRenderer.getPageRect(CurlRenderer.PAGE_RIGHT).width();
+		double radius = pageWidth * 0.058;
+		radius *= Math.max(1f - (pointerPos.mPressure * 0.5f), 0.5f);
+		// NOTE: Here we set pointerPos to mCurlPos. It might be a bit confusing
+		// later to see e.g "mCurlPos.x - mDragStartPos.x" used. But it's
+		// actually pointerPos we are doing calculations against. Why? Simply to
+		// optimize code a bit with the cost of making it unreadable. Otherwise
+		// we had to this in both of the next if-else branches.
+		mCurlPos.set(pointerPos.mPos);
+
+		// If curl happens on right page, or on left page on two page mode,
+		// we'll calculate curl position from pointerPos.
+		if (mCurlState == CURL_RIGHT
+				|| (mCurlState == CURL_LEFT && mViewMode == SHOW_TWO_PAGES)) {
+
+			mCurlDir.x = mCurlPos.x - mDragStartPos.x;
+			mCurlDir.y = mCurlPos.y - mDragStartPos.y;
+			float dist = (float) Math.sqrt(mCurlDir.x * mCurlDir.x + mCurlDir.y
+					* mCurlDir.y);
+
+			// Adjust curl radius so that if page is dragged far enough on
+			// opposite side, radius gets closer to zero.
+			float pageWidth = mRenderer.getPageRect(CurlRenderer.PAGE_RIGHT)
+					.width();
+			double curlLen = radius * Math.PI;
+			if (dist > (pageWidth * 2) - curlLen) {
+				curlLen = Math.max((pageWidth * 2) - dist, 0f);
+				radius = curlLen / Math.PI;
+			}
+
+			// Actual curl position calculation.
+			if (dist >= curlLen) {
+				double translate = (dist - curlLen) / 2;
+				if (mViewMode == SHOW_TWO_PAGES) {
+					mCurlPos.x -= mCurlDir.x * translate / dist;
+				} else {
+					float pageLeftX = mRenderer
+							.getPageRect(CurlRenderer.PAGE_RIGHT).left;
+					radius = Math.max(Math.min(mCurlPos.x - pageLeftX, radius),
+							0f);
+				}
+				mCurlPos.y -= mCurlDir.y * translate / dist;
+			} else {
+				double angle = Math.PI * Math.sqrt(dist / curlLen);
+				double translate = radius * Math.sin(angle);
+				mCurlPos.x += mCurlDir.x * translate / dist;
+				mCurlPos.y += mCurlDir.y * translate / dist;
+			}
+		}
+		// Otherwise we'll let curl follow pointer position.
+		else if (mCurlState == CURL_LEFT) {
+
+			// Adjust radius regarding how close to page edge we are.
+			float pageLeftX = mRenderer.getPageRect(CurlRenderer.PAGE_RIGHT).left;
+			radius = Math.max(Math.min(mCurlPos.x - pageLeftX, radius), 0f);
+
+			float pageRightX = mRenderer.getPageRect(CurlRenderer.PAGE_RIGHT).right;
+			mCurlPos.x -= Math.min(pageRightX - mCurlPos.x, radius);
+			mCurlDir.x = mCurlPos.x + mDragStartPos.x;
+			mCurlDir.y = mCurlPos.y - mDragStartPos.y;
+		}
+
+		setCurlPos(mCurlPos, mCurlDir, radius);
+	}
+
+	/**
+	 * Updates given CurlPage via PageProvider for page located at index.
+	 */
+	private void updatePage(CurlPage page, int index) {
+		// First reset page to initial state.
+		page.reset();
+		// Ask page provider to fill it up with bitmaps and colors.
+		mPageProvider.updatePage(page, mPageBitmapWidth, mPageBitmapHeight,
+				index);
+	}
+
+	/**
+	 * Updates bitmaps for page meshes.
+	 */
+	private void updatePages() {
+		if (mPageProvider == null || mPageBitmapWidth <= 0
+				|| mPageBitmapHeight <= 0) {
+			return;
+		}
+
+		// Remove meshes from renderer.
+		mRenderer.removeCurlMesh(mPageLeft);
+		mRenderer.removeCurlMesh(mPageRight);
+		mRenderer.removeCurlMesh(mPageCurl);
+
+		if (mViewMode == SHOW_TWO_PAGES) {
+			int total = mPageProvider.getPageCount();
+			int leftIdx = -1;
+			int rightIdx = -1;
+
+			if (mCurrentIndex == 0) {
+				// Cover spread: page 0 on right, left is empty
+				leftIdx = -1;
+				rightIdx = 0;
+			} else {
+				leftIdx = (mCurrentIndex % 2 == 1) ? mCurrentIndex : mCurrentIndex - 1;
+				rightIdx = leftIdx + 1;
+			}
+
+			if (leftIdx >= 0 && leftIdx < total) {
+				updatePage(mPageLeft.getTexturePage(), leftIdx);
+				mPageLeft.setFlipTexture(false);
+				mPageLeft.setRect(mRenderer.getPageRect(CurlRenderer.PAGE_LEFT));
+				mPageLeft.reset();
+				mRenderer.addCurlMesh(mPageLeft);
+			}
+
+			if (rightIdx >= 0 && rightIdx < total) {
+				updatePage(mPageRight.getTexturePage(), rightIdx);
+				mPageRight.setFlipTexture(false);
+				mPageRight.setRect(mRenderer.getPageRect(CurlRenderer.PAGE_RIGHT));
+				mPageRight.reset();
+				mRenderer.addCurlMesh(mPageRight);
+			}
+
+			requestRender();
+			return;
+		}
+
+		int leftIdx = mCurrentIndex - 1;
+		int rightIdx = mCurrentIndex;
+		int curlIdx = -1;
+		if (mCurlState == CURL_LEFT) {
+			curlIdx = leftIdx;
+			--leftIdx;
+		} else if (mCurlState == CURL_RIGHT) {
+			curlIdx = rightIdx;
+			++rightIdx;
+		}
+
+		if (rightIdx >= 0 && rightIdx < mPageProvider.getPageCount()) {
+			updatePage(mPageRight.getTexturePage(), rightIdx);
+			mPageRight.setFlipTexture(false);
+			mPageRight.setRect(mRenderer.getPageRect(CurlRenderer.PAGE_RIGHT));
+			mPageRight.reset();
+			mRenderer.addCurlMesh(mPageRight);
+		}
+		if (leftIdx >= 0 && leftIdx < mPageProvider.getPageCount()) {
+			updatePage(mPageLeft.getTexturePage(), leftIdx);
+			mPageLeft.setFlipTexture(true);
+			mPageLeft.setRect(mRenderer.getPageRect(CurlRenderer.PAGE_LEFT));
+			mPageLeft.reset();
+			if (mRenderLeftPage) {
+				mRenderer.addCurlMesh(mPageLeft);
+			}
+		}
+		if (curlIdx >= 0 && curlIdx < mPageProvider.getPageCount()) {
+			updatePage(mPageCurl.getTexturePage(), curlIdx);
+
+			if (mCurlState == CURL_RIGHT) {
+				mPageCurl.setFlipTexture(true);
+				mPageCurl.setRect(mRenderer
+						.getPageRect(CurlRenderer.PAGE_RIGHT));
+			} else {
+				mPageCurl.setFlipTexture(false);
+				mPageCurl
+						.setRect(mRenderer.getPageRect(CurlRenderer.PAGE_LEFT));
+			}
+
+			mPageCurl.reset();
+			mRenderer.addCurlMesh(mPageCurl);
+		}
+	}
+
+	/**
+	 * Provider for feeding 'book' with bitmaps which are used for rendering
+	 * pages.
+	 */
+	public interface PageProvider {
+
+		/**
+		 * Return number of pages available.
+		 */
+		public int getPageCount();
+
+		/**
+		 * Called once new bitmaps/textures are needed. Width and height are in
+		 * pixels telling the size it will be drawn on screen and following them
+		 * ensures that aspect ratio remains. But it's possible to return bitmap
+		 * of any size though. You should use provided CurlPage for storing page
+		 * information for requested page number.<br/>
+		 * <br/>
+		 * Index is a number between 0 and getBitmapCount() - 1.
+		 */
+		public void updatePage(CurlPage page, int width, int height, int index);
+	}
+
+	/**
+	 * Simple holder for pointer position.
+	 */
+	private class PointerPosition {
+		PointF mPos = new PointF();
+		float mPressure;
+	}
+
+	/**
+	 * Observer interface for handling CurlView size changes.
+	 */
+	public interface SizeChangedObserver {
+
+		/**
+		 * Called once CurlView size changes.
+		 */
+		public void onSizeChanged(int width, int height);
+	}
+
+}
