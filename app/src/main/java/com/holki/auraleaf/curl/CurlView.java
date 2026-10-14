@@ -1046,8 +1046,6 @@ public class CurlView extends GLSurfaceView implements View.OnTouchListener,
 
 			// Adjust curl radius so that if page is dragged far enough on
 			// opposite side, radius gets closer to zero.
-			float pageWidth = mRenderer.getPageRect(CurlRenderer.PAGE_RIGHT)
-					.width();
 			double curlLen = radius * Math.PI;
 			if (dist > (pageWidth * 2) - curlLen) {
 				curlLen = Math.max((pageWidth * 2) - dist, 0f);
